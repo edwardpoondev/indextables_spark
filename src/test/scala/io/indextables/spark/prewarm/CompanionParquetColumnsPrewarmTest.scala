@@ -442,4 +442,44 @@ class CompanionParquetColumnsPrewarmTest extends AnyFunSuite with Matchers with 
       )
     }
   }
+
+  // ═══════════════════════════════════════════
+  //  Regression: tantivy-only prewarm on companion tables
+  // ═══════════════════════════════════════════
+
+  test("TERM_DICT + POSTINGS prewarm should succeed for companion tables (tantivy-only regression)") {
+    withTempPath { tempDir =>
+      val deltaPath = new File(tempDir, "delta_table").getAbsolutePath
+      val indexPath = new File(tempDir, "companion_index").getAbsolutePath
+
+      createLocalDeltaTable(deltaPath, numRows = 30)
+
+      spark
+        .sql(
+          s"BUILD INDEXTABLES COMPANION FOR DELTA '$deltaPath' AT LOCATION '$indexPath'"
+        )
+        .collect()(0)
+        .getString(2) shouldBe "success"
+
+      flushCaches()
+
+      // Tantivy-only prewarm (no parquet segments) — this is what CompanionCacheWarmer runs.
+      // Before the fix, this produced 0 prewarmed splits on companion tables because
+      // createSplitSearcherWithCompanionSupport unconditionally used the 4-arg overload.
+      val prewarmResult = spark.sql(
+        s"PREWARM INDEXTABLES CACHE '$indexPath' FOR SEGMENTS (TERM_DICT, POSTINGS)"
+      )
+      val prewarmRows = prewarmResult.collect()
+      prewarmRows.length should be > 0
+
+      val prewarmStatus   = prewarmRows.head.getAs[String]("status")
+      val splitsPrewarmed = prewarmRows.map(_.getAs[Int]("splits_prewarmed")).sum
+
+      prewarmStatus shouldBe "success"
+      prewarmStatus should not include "failed preparation"
+      splitsPrewarmed should be > 0
+
+      logger.info(s"Tantivy-only regression test: status=$prewarmStatus, splits=$splitsPrewarmed")
+    }
+  }
 }

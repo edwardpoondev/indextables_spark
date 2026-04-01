@@ -939,6 +939,10 @@ case class PrewarmCacheCommand(
         val cacheConfig  = ConfigUtils.createSplitCacheConfig(config, Some(task.tablePath))
         val cacheManager = GlobalSplitCacheManager.getInstance(cacheConfig)
 
+        // Determine if parquet companion initialization is needed (same logic as sync path)
+        val needsParquetCompanion = task.parquetSegments.nonEmpty ||
+          task.segments.contains(IndexComponent.FASTFIELD)
+
         task.addActions.foreach { addAction =>
           // Check for cancellation
           if (AsyncPrewarmJobManager.isJobCancelled(task.jobId)) {
@@ -956,10 +960,10 @@ case class PrewarmCacheCommand(
               }
             val actualPath = ProtocolNormalizer.normalizeAllProtocols(fullPath)
 
-            // Create split metadata and searcher (companion-aware: uses 4-arg overload when parquetTableRoot is set)
+            // Create split metadata and searcher (companion-aware: uses 4-arg overload only when parquet companion is needed)
             val splitMetadata = SplitMetadataFactory.fromAddAction(addAction, task.tablePath)
             val splitSearcher =
-              createSplitSearcherWithCompanionSupport(cacheManager, cacheConfig, actualPath, splitMetadata)
+              createSplitSearcherWithCompanionSupport(cacheManager, cacheConfig, actualPath, splitMetadata, needsParquetCompanion)
 
             try {
               // Prewarm based on field selection
@@ -1155,6 +1159,17 @@ case class PrewarmCacheCommand(
 
       val skippedFields = scala.collection.mutable.Set.empty[String]
 
+      // Determine if parquet companion initialization is needed for this task.
+      // Only needed when parquet segments are explicitly requested or FASTFIELD
+      // is requested (may need parquet companion auto-detection for fast fields).
+      // For tantivy-only prewarm (TERM, POSTINGS), skip parquet init to avoid
+      // failures when Iceberg table credentials are unavailable.
+      val needsParquetCompanion = task.parquetSegments.nonEmpty ||
+        task.segments.contains(IndexComponent.FASTFIELD)
+
+      // Track preparation failures for observability
+      val prepFailureCount = new java.util.concurrent.atomic.AtomicInteger(0)
+
       // Phase 1: Prepare all splits and launch all preload futures in parallel
       case class PrewarmWork(
         addAction: io.indextables.spark.transaction.AddAction,
@@ -1177,9 +1192,9 @@ case class PrewarmCacheCommand(
           // Create split metadata from AddAction
           val splitMetadata = SplitMetadataFactory.fromAddAction(addAction, task.tablePath)
 
-          // Create split searcher (companion-aware: uses 4-arg overload when parquetTableRoot is set)
+          // Create split searcher (companion-aware: uses 4-arg overload only when parquet companion is needed)
           val splitSearcher =
-            createSplitSearcherWithCompanionSupport(cacheManager, cacheConfig, actualPath, splitMetadata)
+            createSplitSearcherWithCompanionSupport(cacheManager, cacheConfig, actualPath, splitMetadata, needsParquetCompanion)
 
           val (futures, invalidFields): (Seq[java.util.concurrent.CompletableFuture[Void]], Seq[String]) =
             task.fields match {
@@ -1240,13 +1255,21 @@ case class PrewarmCacheCommand(
           case e: IllegalArgumentException if task.failOnMissingField =>
             throw e
           case e: Exception =>
-            taskLogger.warn(s"Failed to prepare split ${addAction.path} for prewarm: ${e.getMessage}")
+            if (prepFailureCount.getAndIncrement() == 0) {
+              taskLogger.error(
+                s"Prewarm split preparation failed (first of potentially many): " +
+                  s"split=${addAction.path}, error=${e.getClass.getSimpleName}: ${e.getMessage}", e)
+            } else {
+              taskLogger.warn(s"Failed to prepare split ${addAction.path} for prewarm: ${e.getMessage}")
+            }
             None
         }
       }
 
+      val totalPrepFailures = task.addActions.size - preparedWork.size
       taskLogger.info(
-        s"Launched ${preparedWork.map(_.futures.size).sum} async preload operations for ${preparedWork.size} splits"
+        s"Launched ${preparedWork.map(_.futures.size).sum} async preload operations for ${preparedWork.size} splits" +
+          (if (totalPrepFailures > 0) s" ($totalPrepFailures splits failed preparation)" else "")
       )
 
       // Phase 2: Wait for all futures to complete (parallel execution happening now)
@@ -1346,7 +1369,11 @@ case class PrewarmCacheCommand(
 
       val duration = System.currentTimeMillis() - taskStartTime
       val status =
-        if (failedSplits.nonEmpty) "partial"
+        if (preparedWork.isEmpty && totalPrepFailures > 0)
+          s"error: all ${totalPrepFailures} splits failed preparation"
+        else if (failedSplits.nonEmpty) "partial"
+        else if (totalPrepFailures > 0)
+          s"partial (${totalPrepFailures} splits failed preparation)"
         else if (parquetPreloadFailures.nonEmpty)
           s"partial (parquet preload failed: ${parquetPreloadFailures.size} splits)"
         else if (skippedFields.nonEmpty) "partial"
@@ -1391,25 +1418,43 @@ case class PrewarmCacheCommand(
   }
 
   /**
-   * Create a SplitSearcher with companion support. If the cacheConfig has a companionSourceTableRoot, builds a
-   * ParquetStorageConfig and calls the 4-arg createSplitSearcher so the native layer receives the parquet table root.
-   * Otherwise falls back to the 2-arg version. Mirrors the pattern in SplitSearchEngine (lines 125-145).
+   * Create a SplitSearcher with companion support. Uses the 4-arg createSplitSearcher (with parquetTableRoot)
+   * only when parquet companion initialization is actually needed (parquet segments or FASTFIELD requested).
+   * For tantivy-only prewarm (TERM, POSTINGS), uses the simpler 2-arg version to avoid unnecessary parquet
+   * initialization that can fail when Iceberg table credentials are unavailable on the query JVM.
+   *
+   * If the 4-arg path fails, falls back to the 2-arg version so tantivy components still get prewarmed.
    */
   private def createSplitSearcherWithCompanionSupport(
     cacheManager: io.indextables.tantivy4java.split.SplitCacheManager,
     cacheConfig: SplitCacheConfig,
     actualPath: String,
-    splitMetadata: io.indextables.tantivy4java.split.merge.QuickwitSplit.SplitMetadata
+    splitMetadata: io.indextables.tantivy4java.split.merge.QuickwitSplit.SplitMetadata,
+    needsParquetCompanion: Boolean
   ): io.indextables.tantivy4java.split.SplitSearcher =
-    cacheConfig.companionSourceTableRoot match {
-      case Some(tableRoot) =>
+    (cacheConfig.companionSourceTableRoot, needsParquetCompanion) match {
+      case (Some(tableRoot), true) =>
+        // Full companion mode — parquet segments or FASTFIELD requested
         val pqStorageConfig = buildParquetStorageConfig(cacheConfig)
         logger.info(
           s"Companion prewarm: per-split parquetTableRoot=$tableRoot, " +
             s"parquetStorageConfig=${if (pqStorageConfig.isDefined) "present" else "none"} for $actualPath"
         )
-        cacheManager.createSplitSearcher(actualPath, splitMetadata, tableRoot, pqStorageConfig.orNull)
-      case None =>
+        try
+          cacheManager.createSplitSearcher(actualPath, splitMetadata, tableRoot, pqStorageConfig.orNull)
+        catch {
+          case e: Exception =>
+            logger.warn(
+              s"Companion parquet init failed for $actualPath: ${e.getMessage}. " +
+                s"Falling back to tantivy-only mode — parquet segments will be skipped."
+            )
+            cacheManager.createSplitSearcher(actualPath, splitMetadata)
+        }
+      case (Some(_), false) =>
+        // Companion table but only tantivy segments requested — skip parquet initialization
+        logger.debug(s"Companion prewarm: tantivy-only mode (no parquet segments needed) for $actualPath")
+        cacheManager.createSplitSearcher(actualPath, splitMetadata)
+      case (None, _) =>
         cacheManager.createSplitSearcher(actualPath, splitMetadata)
     }
 
